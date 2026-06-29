@@ -1,4 +1,4 @@
-name: CI/CD Deploy Frontend
+name: CI/CD Deploy Frontend to AWS ECS
 
 on:
   push:
@@ -6,42 +6,54 @@ on:
       - deploy
 
 jobs:
-  build-and-push:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 18
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - name: Build and push image
-        uses: docker/build-push-action@v4
-        with:
-          context: .
-          push: true
-          tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/innovatech-frontend:latest
-            ${{ secrets.DOCKERHUB_USERNAME }}/innovatech-frontend:${{ github.sha }}
-          build-args: |
-            VITE_API_URL=${{ secrets.FRONTEND_API_URL }}
-
   deploy:
-    needs: build-and-push
+    name: Build, Push and Deploy to ECS Fargate
     runs-on: ubuntu-latest
+
     steps:
-      - name: Deploy to EC2 via SSH
-        uses: appleboy/ssh-action@v0.1.7
+      # 1. Descargar el código fuente del repositorio
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # 2. Configurar las credenciales de AWS
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_SSH_KEY }}
-          script: |
-            echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin || true
-            docker pull ${{ secrets.DOCKERHUB_USERNAME }}/innovatech-frontend:latest
-            docker rm -f frontend || true
-            docker run -d --name frontend --restart unless-stopped -p 80:8080 ${{ secrets.DOCKERHUB_USERNAME }}/innovatech-frontend:latest
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # 3. Autenticarse en Amazon ECR
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # 4. Compilar la imagen inyectando la URL del Balanceador de AWS y subirla a ECR
+      - name: Build, Tag, and Push Image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: innovatech-frontend
+          IMAGE_TAG: ${{ github.sha }}
+          # REEMPLAZA ESTA URL por la DNS real de tu Application Load Balancer cuando AWS te la entregue
+          ALB_DNS_URL: "http://innovatech-alb-123456789.us-east-1.elb.amazonaws.com:3000"
+        run: |
+          # Construimos pasando la URL de la API como un argumento de compilación (--build-arg)
+          docker build \
+            --build-arg VITE_API_URL=$ALB_DNS_URL \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
+          
+          # Subir la imagen etiquetada al repositorio privado de ECR
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+      # 5. Forzar el redespliegue en el servicio de ECS Fargate
+      - name: Force ECS Service Deployment
+        run: |
+          aws ecs update-service \
+            --cluster innovatech-cluster \
+            --service innovatech-frontend-service \
+            --force-new-deployment \
+            --region ${{ secrets.AWS_REGION }}
