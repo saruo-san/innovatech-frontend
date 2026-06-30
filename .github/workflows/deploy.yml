@@ -1,0 +1,56 @@
+name: CI/CD Deploy Frontend to AWS ECS
+
+on:
+  push:
+    branches:
+      - deploy
+
+jobs:
+  deploy:
+    name: Build, Push and Deploy to ECS Fargate
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Descargar el código fuente del repositorio
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # 2. Configurar las credenciales de AWS
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # 3. Autenticarse en Amazon ECR
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # 4. Compilar la imagen y subirla a ECR (Sin depender de variables de entorno de Vite)
+      - name: Build, Tag, and Push Image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: innovatech-frontend
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # Compilamos la imagen limpia (Nginx se encargará del puente interno)
+          docker build \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
+          
+          # Subir la imagen etiquetada al repositorio privado de ECR
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+      # 5. Forzar el redespliegue en el servicio CORRECTO de ECS Fargate
+      - name: Force ECS Service Deployment
+        run: |
+          aws ecs update-service \
+            --cluster innovatech-cluster \
+            --service innovatech-frontend-v3 \
+            --force-new-deployment \
+            --region ${{ secrets.AWS_REGION }}
